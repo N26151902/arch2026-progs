@@ -1,0 +1,250 @@
+/* Builds the rubik tables with a BFS over all 3,674,160 states (host only).
+ *
+ *   cc -O2 -o build/gen_rubik mytests/gen_rubik.c
+ *   build/gen_rubik src/rubik/rubik_tab.c src/rubik/rubik_tab.S
+ */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum { CUBIES = 7, NSTATES = 3674160, NORI = 729 };
+
+static const uint8_t source[3][CUBIES] = {
+    {1, 4, 2, 0, 3, 5, 6},
+    {0, 1, 2, 4, 5, 6, 3},
+    {0, 2, 5, 3, 1, 4, 6},
+};
+static const uint8_t twist[3][CUBIES] = {
+    {1, 2, 0, 2, 1, 0, 0},
+    {0, 0, 0, 1, 2, 1, 2},
+    {0, 0, 0, 0, 0, 0, 0},
+};
+
+struct cube {
+    uint8_t p[CUBIES], o[CUBIES];
+};
+
+static struct cube turn(struct cube c, int move)
+{
+    int face = move / 3, turns = move % 3 + 1;
+    for (int t = 0; t < turns; t++) {
+        struct cube n;
+        for (int i = 0; i < CUBIES; i++) {
+            int from = source[face][i];
+            n.p[i] = c.p[from];
+            n.o[i] = (uint8_t) ((c.o[from] + twist[face][i]) % 3);
+        }
+        c = n;
+    }
+    return c;
+}
+
+static const int fact[8] = {1, 1, 2, 6, 24, 120, 720, 5040};
+
+static int perm_rank(const uint8_t *p)
+{
+    int r = 0;
+    for (int i = 0; i < CUBIES; i++) {
+        int smaller = 0;
+        for (int j = i + 1; j < CUBIES; j++)
+            smaller += p[j] < p[i];
+        r += smaller * fact[CUBIES - 1 - i];
+    }
+    return r;
+}
+
+static void perm_unrank(int r, uint8_t *p)
+{
+    int used[CUBIES] = {0};
+    for (int i = 0; i < CUBIES; i++) {
+        int f = fact[CUBIES - 1 - i], k = r / f;
+        r %= f;
+        for (int v = 0; v < CUBIES; v++) {
+            if (used[v])
+                continue;
+            if (k-- == 0) {
+                p[i] = (uint8_t) v;
+                used[v] = 1;
+                break;
+            }
+        }
+    }
+}
+
+static int ori_coord(const uint8_t *o)
+{
+    int c = 0;
+    for (int i = CUBIES - 2; i >= 0; i--)
+        c = c * 3 + o[i];
+    return c;
+}
+
+static void ori_decode(int c, uint8_t *o)
+{
+    int sum = 0;
+    for (int i = 0; i < CUBIES - 1; i++) {
+        o[i] = (uint8_t) (c % 3);
+        sum += o[i];
+        c /= 3;
+    }
+    o[CUBIES - 1] = (uint8_t) ((3 - sum % 3) % 3);
+}
+
+static int index_of(const struct cube *c)
+{
+    return perm_rank(c->p) * NORI + ori_coord(c->o);
+}
+
+static struct cube cube_of(int idx)
+{
+    struct cube c = {{0}, {0}};
+    perm_unrank(idx / NORI, c.p);
+    ori_decode(idx % NORI, c.o);
+    return c;
+}
+
+static uint32_t key_of(const struct cube *c)
+{
+    uint32_t P = 0;
+    for (int i = 0; i < CUBIES - 1; i++)
+        P |= (uint32_t) c->p[i] << (3 * i);
+    return (P << 10) | (uint32_t) ori_coord(c->o);
+}
+
+static int8_t dist[NSTATES];
+static int queue[NSTATES];
+static uint32_t near[20000], far[4000];
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
+    return (x > y) - (x < y);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s out.c out.S\n", argv[0]);
+        return 2;
+    }
+    memset(dist, -1, sizeof dist);
+    struct cube solved;
+    for (int i = 0; i < CUBIES; i++) {
+        solved.p[i] = (uint8_t) i;
+        solved.o[i] = 0;
+    }
+    int head = 0, tail = 0, start = index_of(&solved);
+    dist[start] = 0;
+    queue[tail++] = start;
+    int count[16] = {0};
+    while (head < tail) {
+        int s = queue[head++];
+        count[dist[s]]++;
+        struct cube c = cube_of(s);
+        for (int m = 0; m < 9; m++) {
+            struct cube n = turn(c, m);
+            int t = index_of(&n);
+            if (dist[t] < 0) {
+                dist[t] = (int8_t) (dist[s] + 1);
+                queue[tail++] = t;
+            }
+        }
+    }
+    if (tail != NSTATES) {
+        fprintf(stderr, "reached %d states, expected %d\n", tail, NSTATES);
+        return 1;
+    }
+
+    int nnear = 0, nfar = 0;
+    for (int s = 0; s < NSTATES; s++) {
+        struct cube c = cube_of(s);
+        if (dist[s] <= 5)
+            near[nnear++] = (key_of(&c) << 2) | (uint32_t) (dist[s] % 3);
+        else if (dist[s] == 11)
+            far[nfar++] = key_of(&c);
+    }
+    qsort(near, (size_t) nnear, sizeof near[0], cmp_u32);
+    qsort(far, (size_t) nfar, sizeof far[0], cmp_u32);
+    for (int i = 1; i < nnear; i++) {
+        if ((near[i] >> 2) == (near[i - 1] >> 2)) {
+            fprintf(stderr, "duplicate key\n");
+            return 1;
+        }
+    }
+
+    uint16_t omove[9][NORI];
+    for (int m = 0; m < 9; m++) {
+        for (int oc = 0; oc < NORI; oc++) {
+            struct cube c = solved;
+            ori_decode(oc, c.o);
+            struct cube n = turn(c, m);
+            omove[m][oc] = (uint16_t) ori_coord(n.o);
+        }
+    }
+
+    FILE *fc = fopen(argv[1], "w"), *fs = fopen(argv[2], "w");
+    if (!fc || !fs)
+        return 1;
+    const char *note =
+        "Generated by mytests/gen_rubik.c from a breadth-first search over\n"
+        " * all 3,674,160 states. Do not edit.";
+    fprintf(fc,
+            "/* %s */\n\n#include \"rubik_tab.h\"\n\n"
+            "/* clang-format off */\n"
+            "const uint32_t rubik_near[RUBIK_NNEAR] = {\n",
+            note);
+    for (int i = 0; i < nnear; i++)
+        fprintf(fc, "%s0x%08xu,%s", i % 6 ? " " : "    ", near[i],
+                i % 6 == 5 || i == nnear - 1 ? "\n" : "");
+    fprintf(fc, "};\n\nconst uint32_t rubik_far[RUBIK_NFAR] = {\n");
+    for (int i = 0; i < nfar; i++)
+        fprintf(fc, "%s0x%08xu,%s", i % 6 ? " " : "    ", far[i],
+                i % 6 == 5 || i == nfar - 1 ? "\n" : "");
+    fprintf(fc, "};\n\nconst uint16_t rubik_ori_move[9][RUBIK_NORI] = {\n");
+    for (int m = 0; m < 9; m++) {
+        fprintf(fc, "    {\n");
+        for (int i = 0; i < NORI; i++)
+            fprintf(fc, "%s%u,%s", i % 12 ? " " : "        ", omove[m][i],
+                    i % 12 == 11 || i == NORI - 1 ? "\n" : "");
+        fprintf(fc, "    },\n");
+    }
+    fprintf(fc, "};\n/* clang-format on */\n");
+
+    fprintf(fs,
+            "# Generated by mytests/gen_rubik.c from a breadth-first search\n"
+            "# over all 3,674,160 states. Do not edit. The same tables as\n"
+            "# rubik_tab.c, for the assembly object, which is linked on its "
+            "own.\n\n"
+            "    .section .rodata\n    .align 2\n"
+            "    .globl rubik_asm_near\nrubik_asm_near:\n");
+    for (int i = 0; i < nnear; i++)
+        fprintf(fs, "%s0x%08x%s", i % 6 ? ", " : "    .word ", near[i],
+                i % 6 == 5 || i == nnear - 1 ? "\n" : "");
+    fprintf(fs,
+            "    .size rubik_asm_near, %d\n"
+            "    .word 0xffffffff  # sentinel for the last probe\n\n"
+            "    .globl rubik_asm_far\nrubik_asm_far:\n",
+            4 * nnear);
+    for (int i = 0; i < nfar; i++)
+        fprintf(fs, "%s0x%08x%s", i % 6 ? ", " : "    .word ", far[i],
+                i % 6 == 5 || i == nfar - 1 ? "\n" : "");
+    fprintf(fs,
+            "    .size rubik_asm_far, %d\n"
+            "    .word 0xffffffff  # sentinel for the last probe\n\n"
+            "    .globl rubik_asm_ori_move\nrubik_asm_ori_move:\n",
+            4 * nfar);
+    for (int m = 0; m < 9; m++)
+        for (int i = 0; i < NORI; i++)
+            fprintf(fs, "%s%u%s", i % 12 ? ", " : "    .half ", omove[m][i],
+                    i % 12 == 11 || i == NORI - 1 ? "\n" : "");
+    fprintf(fs, "    .size rubik_asm_ori_move, %d\n", 2 * 9 * NORI);
+    fclose(fc);
+    fclose(fs);
+
+    fprintf(stderr, "near %d, far %d, distances:", nnear, nfar);
+    for (int d = 0; d < 12; d++)
+        fprintf(stderr, " %d", count[d]);
+    fprintf(stderr, "\n");
+    return 0;
+}
